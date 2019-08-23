@@ -1248,7 +1248,7 @@ do_process_presence(Nick, #presence{from = From, type = available, lang = Lang} 
 			    ejabberd_router:route_error(Packet1, Err),
 			    StateData;
 			_ ->
-			    change_nick(From, Nick, StateData)
+			    change_nick(From, Nick, Packet, StateData)
 		    end;
 		false ->
 		    Stanza = maybe_strip_status_from_presence(
@@ -1287,7 +1287,7 @@ do_process_presence(Nick, #presence{from = From, type = unavailable} = Packet,
 	    send_new_presence(From, NewState, StateData)
     end,
     Reason = xmpp:get_text(NewPacket#presence.status),
-    remove_online_user(From, NewState, Reason);
+    remove_online_user(From, NewState, Reason, Packet);
 do_process_presence(_Nick, #presence{from = From, type = error, lang = Lang} = Packet,
 		    StateData) ->
     ErrorText = ?T("It is not allowed to send error messages to the"
@@ -1822,10 +1822,10 @@ prepare_room_queue(StateData) ->
       {empty, _} -> StateData
     end.
 
--spec update_online_user(jid(), #user{}, state()) -> state().
-update_online_user(JID, #user{nick = Nick} = User, StateData) ->
+-spec update_online_user(jid(), #user{}, presence(), state()) -> state().
+update_online_user(JID, #user{nick = Nick} = User, Packet, StateData) ->
     LJID = jid:tolower(JID),
-    add_to_log(join, Nick, StateData),
+    add_to_log(join, {Nick, Packet}, StateData),
     Nicks1 = try maps:get(LJID, StateData#state.users) of
 		 #user{nick = OldNick} ->
 		     case lists:delete(
@@ -1878,21 +1878,21 @@ set_subscriber(JID, Nick, Nodes,
     end,
     NewStateData.
 
--spec add_online_user(jid(), binary(), role(), state()) -> state().
-add_online_user(JID, Nick, Role, StateData) ->
+-spec add_online_user(jid(), binary(), role(), presence(), state()) -> state().
+add_online_user(JID, Nick, Role, Packet, StateData) ->
     tab_add_online_user(JID, StateData),
     User = #user{jid = JID, nick = Nick, role = Role},
-    reset_hibernate_timer(update_online_user(JID, User, StateData)).
+    reset_hibernate_timer(update_online_user(JID, User, Packet, StateData)).
 
 -spec remove_online_user(jid(), state()) -> state().
 remove_online_user(JID, StateData) ->
-    remove_online_user(JID, StateData, <<"">>).
+    remove_online_user(JID, StateData, <<"">>, #presence{ type = unavailable}).
 
--spec remove_online_user(jid(), state(), binary()) -> state().
-remove_online_user(JID, StateData, Reason) ->
+-spec remove_online_user(jid(), state(), binary(), presence()) -> state().
+remove_online_user(JID, StateData, Reason, Packet) ->
     LJID = jid:tolower(JID),
     #user{nick = Nick} = maps:get(LJID, StateData#state.users),
-    add_to_log(leave, {Nick, Reason}, StateData),
+    add_to_log(leave, {Nick, Reason, Packet}, StateData),
     tab_remove_online_user(JID, StateData),
     Users = maps:remove(LJID, StateData#state.users),
     Nicks = try maps:get(Nick, StateData#state.nicks) of
@@ -2125,7 +2125,7 @@ add_new_user(From, Nick, Packet, StateData) ->
 			      NewState = add_user_presence(
 					   From, Packet,
 					   add_online_user(From, Nick, Role,
-							   StateData)),
+							   Packet, StateData)),
 			      send_initial_presences_and_messages(
 				From, Nick, Packet, NewState, StateData),
 			      NewState;
@@ -2534,8 +2534,8 @@ set_nick(JID, Nick, State) ->
 	    end,
     State#state{users = Users, nicks = Nicks}.
 
--spec change_nick(jid(), binary(), state()) -> state().
-change_nick(JID, Nick, StateData) ->
+-spec change_nick(jid(), binary(), presence(), state()) -> state().
+change_nick(JID, Nick, Packet, StateData) ->
     LJID = jid:tolower(JID),
     #user{nick = OldNick} = maps:get(LJID, StateData#state.users),
     OldNickUsers = maps:get(OldNick, StateData#state.nicks),
@@ -2549,7 +2549,7 @@ change_nick(JID, Nick, StateData) ->
                                SendOldUnavailable, SendNewAvailable);
         false -> ok
     end,
-    add_to_log(nickchange, {OldNick, Nick}, StateData),
+    add_to_log(nickchange, {OldNick, Nick, Packet, SendOldUnavailable}, StateData),
     NewStateData.
 
 -spec send_nick_changing(jid(), binary(), state(), boolean(), boolean()) -> ok.
@@ -3240,7 +3240,7 @@ send_kickban_presence(UJID, JID, Reason, Code, NewAffiliation,
 	    end,
     lists:foreach(fun (LJ) ->
 			  #user{nick = Nick, jid = J} = maps:get(LJ, StateData#state.users),
-			  add_to_log(kickban, {Nick, Reason, Code}, StateData),
+			  add_to_log(kickban, {Nick, Reason, Code, LJ, NewAffiliation, UJID, get_actor_nick(UJID, StateData)}, StateData),
 			  tab_remove_online_user(J, StateData),
 			  send_kickban_presence1(UJID, J, Reason, Code,
 						 NewAffiliation, StateData)
@@ -3472,7 +3472,7 @@ get_default_room_maxusers(RoomState) ->
     RoomState2 = set_opts(DefRoomOpts, RoomState),
     (RoomState2#state.config)#config.max_users.
 
--spec get_config(binary(), state(), jid()) -> xdata().
+-spec get_config(binary(), state(), undefined | jid()) -> xdata().
 get_config(Lang, StateData, From) ->
     {_AccessRoute, _AccessCreate, _AccessAdmin, AccessPersistent, _AccessMam} =
 	StateData#state.access,
@@ -3483,10 +3483,18 @@ get_config(Lang, StateData, From) ->
     Title = str:format(
 	      translate:translate(Lang, ?T("Configuration of room ~s")),
 	      [jid:encode(StateData#state.jid)]),
+    MatchAccessPersistent = case From of
+                                undefined -> allow;
+                                _ -> acl:match_rule(StateData#state.server_host, AccessPersistent, From)
+                            end,
+    CheckAccessLog = case From of
+                         undefined -> allow;
+                         _ -> mod_muc_log:check_access_log(StateData#state.server_host, From)
+                     end,
     Fs = [{roomname, Config#config.title},
 	  {roomdesc, Config#config.description},
 	  {lang, Config#config.lang}] ++
-	case acl:match_rule(StateData#state.server_host, AccessPersistent, From) of
+	case MatchAccessPersistent of
 	    allow -> [{persistentroom, Config#config.persistent}];
 	    deny -> []
 	end ++
@@ -3537,7 +3545,7 @@ get_config(Lang, StateData, From) ->
 		[]
 	end
 	++
-	case mod_muc_log:check_access_log(StateData#state.server_host, From) of
+	case CheckAccessLog of
 	    allow -> [{enablelogging, Config#config.logging}];
 	    deny -> []
 	end,
@@ -3564,7 +3572,8 @@ set_config(Options, StateData, Lang) ->
 	       end,
 	Users = [{U#user.jid, U#user.nick, U#user.role}
 		 || U <- maps:values(StateData#state.users)],
-	add_to_log(Type, Users, NSD),
+        NewConfig = get_config(<<"en">>, NSD, undefined),
+	add_to_log(Type, {Users, NewConfig}, NSD),
 	Res
     catch  _:{badmatch, {error, #stanza_error{}} = Err} ->
 	    Err
